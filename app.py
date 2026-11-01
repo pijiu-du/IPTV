@@ -1,9 +1,8 @@
 import os
 import sys
 import time
-import atexit
+import fcntl
 import socket
-import threading
 import subprocess
 import urllib.request
 import urllib.error
@@ -11,40 +10,50 @@ import urllib.error
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(ROOT, "ysp-live-v9.5.py")
 LOCAL_PORT = 8768
+LOCK_FILE = "/tmp/ysp-backend.lock"
 
-_lock = threading.Lock()
-_process = None
+
+def port_ready():
+    try:
+        with socket.create_connection(("127.0.0.1", LOCAL_PORT), timeout=1):
+            return True
+    except OSError:
+        return False
 
 
 def start_backend():
-    global _process
+    os.makedirs("/tmp/ysp-data", exist_ok=True)
 
-    with _lock:
-        if _process and _process.poll() is None:
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+        if port_ready():
             return
 
         env = os.environ.copy()
         env["YSP_DATA_DIR"] = "/tmp/ysp-data"
-        os.makedirs(env["YSP_DATA_DIR"], exist_ok=True)
 
-        _process = subprocess.Popen([
-            sys.executable,
-            SCRIPT,
-            str(LOCAL_PORT),
-            "--bind", "127.0.0.1",
-            "--no-engine"
-        ], cwd=ROOT, env=env)
+        subprocess.Popen(
+            [
+                sys.executable,
+                SCRIPT,
+                str(LOCAL_PORT),
+                "--bind", "127.0.0.1",
+                "--no-engine"
+            ],
+            cwd=ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
 
         for _ in range(30):
-            try:
-                with socket.create_connection(
-                    ("127.0.0.1", LOCAL_PORT), timeout=1
-                ):
-                    return
-            except OSError:
-                time.sleep(1)
+            if port_ready():
+                return
+            time.sleep(1)
 
-        raise RuntimeError("IPTV 后端启动失败")
+        raise RuntimeError("IPTV 后端启动超时")
 
 
 def application(environ, start_response):
@@ -54,6 +63,7 @@ def application(environ, start_response):
         path = environ.get("PATH_INFO", "/")
         query = environ.get("QUERY_STRING", "")
         url = f"http://127.0.0.1:{LOCAL_PORT}{path}"
+
         if query:
             url += "?" + query
 
@@ -64,10 +74,12 @@ def application(environ, start_response):
             if environ.get(key):
                 headers[key[5:].replace("_", "-").title()] = environ[key]
 
-        req = urllib.request.Request(url, headers=headers, method=method)
+        request = urllib.request.Request(
+            url, headers=headers, method=method
+        )
 
         try:
-            response = urllib.request.urlopen(req, timeout=60)
+            response = urllib.request.urlopen(request, timeout=60)
         except urllib.error.HTTPError as e:
             response = e
 
@@ -88,10 +100,10 @@ def application(environ, start_response):
         def stream():
             try:
                 while True:
-                    chunk = response.read(65536)
-                    if not chunk:
+                    data = response.read(65536)
+                    if not data:
                         break
-                    yield chunk
+                    yield data
             finally:
                 response.close()
 
@@ -101,15 +113,9 @@ def application(environ, start_response):
         body = str(e).encode("utf-8")
         start_response(
             "502 Bad Gateway",
-            [("Content-Type", "text/plain; charset=utf-8"),
-             ("Content-Length", str(len(body)))]
+            [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body)))
+            ]
         )
         return [body]
-
-
-def cleanup():
-    if _process and _process.poll() is None:
-        _process.terminate()
-
-
-atexit.register(cleanup)
