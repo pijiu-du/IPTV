@@ -44,8 +44,8 @@ def start_backend():
             cwd=ROOT,
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stdout=open("/tmp/ysp-backend.log", "a"),
+            stderr=subprocess.STDOUT
         )
 
         for _ in range(30):
