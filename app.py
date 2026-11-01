@@ -53,7 +53,7 @@ def start_backend():
                 return
             time.sleep(1)
 
-                try:
+        try:
             with open("/tmp/ysp-backend.log", "r", encoding="utf-8", errors="replace") as f:
                 log = f.read()[-6000:]
         except Exception as e:
