@@ -53,7 +53,15 @@ def start_backend():
                 return
             time.sleep(1)
 
-        raise RuntimeError("IPTV 后端启动超时")
+                try:
+            with open("/tmp/ysp-backend.log", "r", encoding="utf-8", errors="replace") as f:
+                log = f.read()[-6000:]
+        except Exception as e:
+            log = "日志读取失败：" + str(e)
+
+        raise RuntimeError(
+            "IPTV 后端启动超时\n后端日志：\n" + log
+        )
 
 
 def application(environ, start_response):
