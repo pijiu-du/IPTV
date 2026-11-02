@@ -1,3 +1,4 @@
+
 import os
 import sys
 import time
@@ -21,24 +22,23 @@ DATA_DIR = os.environ.get("YSP_DATA_DIR", "/tmp/ysp-data")
 
 START_WAIT_SECONDS = 25
 
-# 诊断密钥：请保留此值
 DIAG_TOKEN = "KM-YSP-2026-11-02-a83f92c71e6b"
 
 
-# =========================================================
-# 端口连接测试
-# =========================================================
+# ==================================================
+# 基础端口测试
+# ==================================================
 
-def port_test():
+def port_test(host=LOCAL_HOST):
     try:
         with socket.create_connection(
-            (LOCAL_HOST, LOCAL_PORT), timeout=2
+            (host, LOCAL_PORT), timeout=3
         ):
             return True, "连接成功"
 
     except OSError as e:
         return False, (
-            "连接失败：类型={}，errno={}，错误={}".format(
+            "类型={}，errno={}，错误={}".format(
                 type(e).__name__,
                 getattr(e, "errno", None),
                 str(e)
@@ -50,9 +50,9 @@ def port_ready():
     return port_test()[0]
 
 
-# =========================================================
-# 后端进程信息
-# =========================================================
+# ==================================================
+# 后端 PID
+# ==================================================
 
 def get_backend_pid():
     try:
@@ -85,7 +85,6 @@ def get_process_info():
             status = f.read()
 
         state = "未知"
-
         for line in status.splitlines():
             if line.startswith("State:"):
                 state = line.strip()
@@ -105,9 +104,9 @@ def get_process_info():
         return "读取进程信息失败：" + str(e)
 
 
-# =========================================================
-# 网络命名空间诊断
-# =========================================================
+# ==================================================
+# 网络命名空间
+# ==================================================
 
 def read_netns(path):
     try:
@@ -116,9 +115,9 @@ def read_netns(path):
         return "读取失败：" + str(e)
 
 
-# =========================================================
-# TCP 监听表诊断
-# =========================================================
+# ==================================================
+# TCP 监听表
+# ==================================================
 
 def decode_tcp_address(hex_address, ipv6=False):
     try:
@@ -131,8 +130,7 @@ def decode_tcp_address(hex_address, ipv6=False):
             )
             return socket.inet_ntop(socket.AF_INET6, raw)
 
-        raw = raw[::-1]
-        return socket.inet_ntop(socket.AF_INET, raw)
+        return socket.inet_ntop(socket.AF_INET, raw[::-1])
 
     except Exception:
         return hex_address
@@ -157,29 +155,23 @@ def read_listen_entries(path):
                 if len(fields) < 10:
                     continue
 
-                local = fields[1]
-                state = fields[3]
-                inode = fields[9]
-
                 try:
-                    address_hex, port_hex = local.split(":")
+                    address_hex, port_hex = fields[1].split(":")
                     port = int(port_hex, 16)
                 except (ValueError, IndexError):
                     continue
 
-                # 0A 表示 LISTEN
-                if port != LOCAL_PORT or state != "0A":
+                if port != LOCAL_PORT or fields[3] != "0A":
                     continue
-
-                address = decode_tcp_address(
-                    address_hex, ipv6
-                )
 
                 results.append({
                     "file": filename,
-                    "address": address,
+                    "address": decode_tcp_address(
+                        address_hex, ipv6
+                    ),
                     "port": port,
-                    "inode": inode
+                    "queue": fields[4],
+                    "inode": fields[9]
                 })
 
         except OSError as e:
@@ -191,59 +183,133 @@ def read_listen_entries(path):
     return results
 
 
-# =========================================================
-# 检查监听 socket 是否属于后端进程
-# =========================================================
+# ==================================================
+# 检查监听 Socket 所属进程
+# ==================================================
 
 def check_socket_owner(pid, entries):
     if not pid:
-        return "没有有效后端 PID，无法检查"
+        return "没有有效后端 PID"
 
-    target_inodes = {
+    inodes = {
         item["inode"]
         for item in entries
         if "inode" in item
     }
 
-    if not target_inodes:
+    if not inodes:
         return "没有发现 8768 LISTEN socket"
 
     found = []
-    fd_path = "/proc/{}/fd".format(pid)
 
     try:
-        for fd in os.listdir(fd_path):
-            filepath = os.path.join(fd_path, fd)
+        fd_path = "/proc/{}/fd".format(pid)
 
+        for fd in os.listdir(fd_path):
             try:
-                target = os.readlink(filepath)
+                target = os.readlink(
+                    os.path.join(fd_path, fd)
+                )
             except OSError:
                 continue
 
-            for inode in target_inodes:
-                if target == "socket:[{}]".format(inode):
-                    found.append(
-                        "FD {} -> {}".format(fd, target)
-                    )
+            if any(
+                target == "socket:[{}]".format(inode)
+                for inode in inodes
+            ):
+                found.append("FD {} -> {}".format(fd, target))
 
     except OSError as e:
-        return "读取后端 FD 失败：" + str(e)
+        return "读取 FD 失败：" + str(e)
 
     if found:
-        return "是，找到监听 socket：\n" + "\n".join(found)
+        return "找到监听 Socket：\n" + "\n".join(found)
 
-    return "否，后端 PID 的 FD 中没有找到对应监听 socket"
+    return "未找到对应监听 Socket"
 
 
-# =========================================================
+# ==================================================
+# 独立 Python 子进程测试
+# ==================================================
+
+def child_process_test():
+    code = (
+        "import socket;"
+        "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
+        "s.settimeout(3);"
+        "r=s.connect_ex(('127.0.0.1',8768));"
+        "print('connect_ex结果:',r);"
+        "s.close()"
+    )
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8
+        )
+
+        return (
+            "退出码：{}\n标准输出：{}\n错误输出：{}".format(
+                result.returncode,
+                result.stdout.strip(),
+                result.stderr.strip()
+            )
+        )
+
+    except Exception as e:
+        return "子进程测试失败：{}：{}".format(
+            type(e).__name__, str(e)
+        )
+
+
+# ==================================================
+# HTTP 健康检查
+# ==================================================
+
+def http_health_test():
+    url = "http://127.0.0.1:{}/health".format(LOCAL_PORT)
+
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "IPTV-Diagnostic"}
+        )
+
+        with urllib.request.urlopen(
+            request, timeout=5
+        ) as response:
+            body = response.read(2000).decode(
+                "utf-8", errors="replace"
+            )
+
+            return (
+                "HTTP 状态：{}\n响应内容：{}".format(
+                    response.status, body
+                )
+            )
+
+    except urllib.error.HTTPError as e:
+        return "HTTP 错误：{} {}".format(
+            e.code, e.reason
+        )
+
+    except Exception as e:
+        return "{}：{}".format(
+            type(e).__name__, str(e)
+        )
+
+
+# ==================================================
 # 后端日志
-# =========================================================
+# ==================================================
 
 def read_backend_log():
     try:
         with open(
-            LOG_FILE,
-            "r",
+            LOG_FILE, "r",
             encoding="utf-8",
             errors="replace"
         ) as f:
@@ -256,24 +322,23 @@ def read_backend_log():
         return "日志读取失败：" + str(e)
 
 
-# =========================================================
+# ==================================================
 # 完整诊断
-# =========================================================
+# ==================================================
 
 def diagnostic():
     pid = get_backend_pid()
 
-    # Gunicorn 当前 worker 的网络命名空间
     worker_netns = read_netns("/proc/self/ns/net")
 
-    # IPTV 后端进程的网络命名空间
     backend_netns = (
         read_netns("/proc/{}/ns/net".format(pid))
         if pid else "没有有效后端 PID"
     )
 
-    # 分别读取两个进程所在网络命名空间的 TCP 表
-    worker_entries = read_listen_entries("/proc/self/net")
+    worker_entries = read_listen_entries(
+        "/proc/self/net"
+    )
 
     backend_entries = (
         read_listen_entries("/proc/{}/net".format(pid))
@@ -281,6 +346,10 @@ def diagnostic():
     )
 
     connected, connect_detail = port_test()
+
+    localhost_connected, localhost_detail = port_test(
+        "localhost"
+    )
 
     lines = [
         "IPTV 后端诊断",
@@ -291,48 +360,57 @@ def diagnostic():
 
         "",
         "========== 网络命名空间 ==========",
-        "Gunicorn worker：{}".format(worker_netns),
-        "IPTV 后端进程：{}".format(backend_netns),
+        "Gunicorn：{}".format(worker_netns),
+        "IPTV 后端：{}".format(backend_netns),
         "是否相同：{}".format(
             "是" if worker_netns == backend_netns else "否"
         ),
 
         "",
-        "========== Gunicorn 所见 TCP 监听 =========="
+        "========== Gunicorn TCP 监听表 =========="
     ]
 
     if worker_entries:
-        for item in worker_entries:
-            lines.append(str(item))
+        lines.extend(str(x) for x in worker_entries)
     else:
-        lines.append(
-            "Gunicorn 所在网络命名空间未发现 8768 LISTEN"
-        )
+        lines.append("未发现 8768 LISTEN")
 
     lines.extend([
         "",
-        "========== IPTV 后端所在 TCP 监听 =========="
+        "========== 后端 TCP 监听表 =========="
     ])
 
     if backend_entries:
-        for item in backend_entries:
-            lines.append(str(item))
+        lines.extend(str(x) for x in backend_entries)
     else:
-        lines.append(
-            "后端所在网络命名空间未发现 8768 LISTEN"
-        )
+        lines.append("未发现 8768 LISTEN")
 
     lines.extend([
         "",
-        "========== 监听 socket 所属进程 ==========",
+        "========== Socket 所属进程 ==========",
         check_socket_owner(pid, backend_entries),
 
         "",
-        "========== Gunicorn 连接测试 ==========",
-        "8768 端口状态：{}".format(
-            "正常连接" if connected else "无法连接"
+        "========== Gunicorn 直接连接测试 ==========",
+        "127.0.0.1：{}".format(
+            "成功" if connected else "失败"
         ),
         connect_detail,
+
+        "",
+        "========== localhost 连接测试 ==========",
+        "localhost：{}".format(
+            "成功" if localhost_connected else "失败"
+        ),
+        localhost_detail,
+
+        "",
+        "========== 独立 Python 子进程测试 ==========",
+        child_process_test(),
+
+        "",
+        "========== HTTP 健康检查 ==========",
+        http_health_test(),
 
         "",
         "========== 后端进程 ==========",
@@ -346,9 +424,9 @@ def diagnostic():
     return "\n".join(lines)
 
 
-# =========================================================
-# 启动 IPTV 后端
-# =========================================================
+# ==================================================
+# 启动后端
+# ==================================================
 
 def start_backend():
     if not os.path.isfile(SCRIPT):
@@ -364,14 +442,12 @@ def start_backend():
 
         pid = get_backend_pid()
 
-        # 已有真实后端进程：等待，不重复启动
         if pid:
             deadline = time.monotonic() + 8
 
             while time.monotonic() < deadline:
                 if port_ready():
                     return
-
                 time.sleep(1)
 
             raise RuntimeError(
@@ -379,7 +455,6 @@ def start_backend():
                 + diagnostic()
             )
 
-        # 清理无效 PID 文件
         try:
             os.remove(PID_FILE)
         except FileNotFoundError:
@@ -432,15 +507,14 @@ def start_backend():
         )
 
 
-# =========================================================
-# WSGI 应用入口
-# =========================================================
+# ==================================================
+# WSGI 应用
+# ==================================================
 
 def application(environ, start_response):
     method = environ.get("REQUEST_METHOD", "GET").upper()
     path = environ.get("PATH_INFO", "/")
 
-    # 独立诊断入口，不触发后端启动
     if path == "/__diag":
         query = urllib.parse.parse_qs(
             environ.get("QUERY_STRING", "")
@@ -458,12 +532,10 @@ def application(environ, start_response):
                     ("Content-Length", str(len(body)))
                 ]
             )
-
             return [body]
 
         body = diagnostic().encode(
-            "utf-8",
-            errors="replace"
+            "utf-8", errors="replace"
         )
 
         start_response(
@@ -482,9 +554,7 @@ def application(environ, start_response):
         query = environ.get("QUERY_STRING", "")
 
         url = "http://{}:{}{}".format(
-            LOCAL_HOST,
-            LOCAL_PORT,
-            path
+            LOCAL_HOST, LOCAL_PORT, path
         )
 
         if query:
@@ -527,16 +597,13 @@ def application(environ, start_response):
 
         try:
             response = urllib.request.urlopen(
-                request,
-                timeout=45
+                request, timeout=45
             )
-
         except urllib.error.HTTPError as e:
             response = e
 
         status = "{} {}".format(
-            response.status,
-            response.reason
+            response.status, response.reason
         )
 
         response_headers = [
@@ -572,8 +639,7 @@ def application(environ, start_response):
 
     except Exception as e:
         message = str(e).encode(
-            "utf-8",
-            errors="replace"
+            "utf-8", errors="replace"
         )
 
         start_response(
