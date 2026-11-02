@@ -11,17 +11,22 @@ import urllib.error
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(ROOT, "ysp-live-v9.5.py")
 
+LOCAL_HOST = "127.0.0.1"
 LOCAL_PORT = 8768
+
 LOCK_FILE = "/tmp/ysp-backend.lock"
 PID_FILE = "/tmp/ysp-backend.pid"
 LOG_FILE = "/tmp/ysp-backend.log"
 DATA_DIR = "/tmp/ysp-data"
 
+# 首次启动最多等待25秒
+START_WAIT_SECONDS = 25
+
 
 def port_ready():
     try:
         with socket.create_connection(
-            ("127.0.0.1", LOCAL_PORT), timeout=2
+            (LOCAL_HOST, LOCAL_PORT), timeout=2
         ):
             return True
     except OSError:
@@ -41,28 +46,33 @@ def backend_process_running():
         return False
 
 
+def read_backend_log():
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8",
+                  errors="replace") as f:
+            return f.read()[-5000:]
+    except OSError as e:
+        return "日志读取失败：" + str(e)
+
+
 def start_backend():
+    if not os.path.isfile(SCRIPT):
+        raise RuntimeError("找不到后端文件：" + SCRIPT)
+
     os.makedirs(DATA_DIR, exist_ok=True)
 
     with open(LOCK_FILE, "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
 
-        # 已经启动并监听端口，直接使用
         if port_ready():
             return
 
-        # 已有后端进程，等待它就绪，不重复启动
+        # 已有进程但端口未就绪，不重复启动
         if backend_process_running():
-            for _ in range(60):
-                if port_ready():
-                    return
-                time.sleep(1)
-
             raise RuntimeError(
-                "IPTV 后端进程存在，但 8768 端口未就绪"
+                "IPTV 后端正在启动，端口尚未就绪，请稍后重试。"
             )
 
-        # 清理旧 PID 文件
         try:
             os.remove(PID_FILE)
         except FileNotFoundError:
@@ -77,7 +87,7 @@ def start_backend():
                     sys.executable,
                     SCRIPT,
                     str(LOCAL_PORT),
-                    "--bind", "127.0.0.1",
+                    "--bind", LOCAL_HOST,
                     "--no-engine"
                 ],
                 cwd=ROOT,
@@ -91,8 +101,10 @@ def start_backend():
         with open(PID_FILE, "w") as f:
             f.write(str(process.pid))
 
-        # 等待后端启动
-        for _ in range(60):
+        # 等待首次启动，避免请求无限等待
+        deadline = time.monotonic() + START_WAIT_SECONDS
+
+        while time.monotonic() < deadline:
             if port_ready():
                 return
 
@@ -101,52 +113,62 @@ def start_backend():
 
             time.sleep(1)
 
-        try:
-            with open(LOG_FILE, "r", encoding="utf-8",
-                      errors="replace") as f:
-                log_text = f.read()[-6000:]
-        except Exception as e:
-            log_text = "日志读取失败：" + str(e)
-
         raise RuntimeError(
-            "IPTV 后端启动失败或超时\n后端日志：\n" + log_text
+            "IPTV 后端未能在25秒内就绪，请检查后端日志。"
+            "\n" + read_backend_log()
         )
 
 
 def application(environ, start_response):
+    method = environ.get("REQUEST_METHOD", "GET").upper()
+
     try:
         start_backend()
 
         path = environ.get("PATH_INFO", "/")
         query = environ.get("QUERY_STRING", "")
 
-        url = f"http://127.0.0.1:{LOCAL_PORT}{path}"
+        url = f"http://{LOCAL_HOST}:{LOCAL_PORT}{path}"
 
         if query:
             url += "?" + query
 
-        method = environ.get("REQUEST_METHOD", "GET")
         headers = {}
 
         for key in (
             "HTTP_USER_AGENT",
             "HTTP_ACCEPT",
-            "HTTP_RANGE"
+            "HTTP_RANGE",
+            "HTTP_AUTHORIZATION",
+            "HTTP_COOKIE",
+            "CONTENT_TYPE"
         ):
             if environ.get(key):
                 headers[
                     key[5:].replace("_", "-").title()
                 ] = environ[key]
 
+        body = None
+
+        if method in ("POST", "PUT", "PATCH", "DELETE"):
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or "0")
+            except ValueError:
+                length = 0
+
+            if length > 0:
+                body = environ["wsgi.input"].read(length)
+
         request = urllib.request.Request(
             url,
+            data=body,
             headers=headers,
             method=method
         )
 
         try:
             response = urllib.request.urlopen(
-                request, timeout=60
+                request, timeout=45
             )
         except urllib.error.HTTPError as e:
             response = e
@@ -182,17 +204,20 @@ def application(environ, start_response):
         return stream()
 
     except Exception as e:
-        body = str(e).encode("utf-8")
+        message = str(e).encode(
+            "utf-8", errors="replace"
+        )
 
         start_response(
-            "502 Bad Gateway",
+            "503 Service Unavailable",
             [
                 ("Content-Type", "text/plain; charset=utf-8"),
-                ("Content-Length", str(len(body)))
+                ("Content-Length", str(len(message))),
+                ("Retry-After", "5")
             ]
         )
 
-        return [body]
+        return [message]
 
 
 app = application
